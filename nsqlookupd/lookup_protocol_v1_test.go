@@ -34,9 +34,13 @@ func testIOLoopReturnsClientErr(t *testing.T, fakeConn test.FakeNetConn) {
 
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 
-	prot := &LookupProtocolV1{ctx: &Context{nsqlookupd: New(opts)}}
+	nsqlookupd, err := New(opts)
+	test.Nil(t, err)
+	prot := &LookupProtocolV1{ctx: &Context{nsqlookupd: nsqlookupd}}
+
+	nsqlookupd.tcpServer = &tcpServer{ctx: prot.ctx}
 
 	errChan := make(chan error)
 	testIOLoop := func() {
@@ -45,7 +49,6 @@ func testIOLoopReturnsClientErr(t *testing.T, fakeConn test.FakeNetConn) {
 	}
 	go testIOLoop()
 
-	var err error
 	var timeout bool
 
 	select {

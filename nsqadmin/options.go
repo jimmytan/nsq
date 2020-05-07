@@ -7,13 +7,12 @@ import (
 )
 
 type Options struct {
-	LogLevel  string `flag:"log-level"`
-	LogPrefix string `flag:"log-prefix"`
-	Verbose   bool   `flag:"verbose"` // for backwards compatibility
+	LogLevel  lg.LogLevel `flag:"log-level"`
+	LogPrefix string      `flag:"log-prefix"`
 	Logger    Logger
-	logLevel  lg.LogLevel // private, not really an option
 
 	HTTPAddress string `flag:"http-address"`
+	BasePath    string `flag:"base-path"`
 
 	GraphiteURL   string `flag:"graphite-url"`
 	ProxyGraphite bool   `flag:"proxy-graphite"`
@@ -46,8 +45,9 @@ type Options struct {
 func NewOptions() *Options {
 	return &Options{
 		LogPrefix:                "[nsqadmin] ",
-		LogLevel:                 "info",
+		LogLevel:                 lg.INFO,
 		HTTPAddress:              "0.0.0.0:4171",
+		BasePath:                 "/",
 		StatsdPrefix:             "nsq.%s",
 		StatsdCounterFormat:      "stats.counters.%s.count",
 		StatsdGaugeFormat:        "stats.gauges.%s",

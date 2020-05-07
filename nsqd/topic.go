@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/nsqio/go-diskqueue"
+	"github.com/nsqio/nsq/internal/lg"
 	"github.com/nsqio/nsq/internal/quantile"
 	"github.com/nsqio/nsq/internal/util"
 )
@@ -16,6 +17,7 @@ import (
 type Topic struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	messageCount uint64
+	messageBytes uint64
 
 	sync.RWMutex
 
@@ -23,6 +25,7 @@ type Topic struct {
 	channelMap        map[string]*Channel
 	backend           BackendQueue
 	memoryMsgChan     chan *Message
+	startChan         chan int
 	exitChan          chan int
 	channelUpdateChan chan int
 	waitGroup         util.WaitGroupWrapper
@@ -34,7 +37,7 @@ type Topic struct {
 	deleter        sync.Once
 
 	paused    int32
-	pauseChan chan bool
+	pauseChan chan int
 
 	ctx *context
 }
@@ -44,34 +47,52 @@ func NewTopic(topicName string, ctx *context, deleteCallback func(*Topic)) *Topi
 	t := &Topic{
 		name:              topicName,
 		channelMap:        make(map[string]*Channel),
-		memoryMsgChan:     make(chan *Message, ctx.nsqd.getOpts().MemQueueSize),
+		memoryMsgChan:     nil,
+		startChan:         make(chan int, 1),
 		exitChan:          make(chan int),
 		channelUpdateChan: make(chan int),
 		ctx:               ctx,
-		pauseChan:         make(chan bool),
+		paused:            0,
+		pauseChan:         make(chan int),
 		deleteCallback:    deleteCallback,
 		idFactory:         NewGUIDFactory(ctx.nsqd.getOpts().ID),
 	}
-
+	// create mem-queue only if size > 0 (do not use unbuffered chan)
+	if ctx.nsqd.getOpts().MemQueueSize > 0 {
+		t.memoryMsgChan = make(chan *Message, ctx.nsqd.getOpts().MemQueueSize)
+	}
 	if strings.HasSuffix(topicName, "#ephemeral") {
 		t.ephemeral = true
 		t.backend = newDummyBackendQueue()
 	} else {
-		t.backend = diskqueue.New(topicName,
+		dqLogf := func(level diskqueue.LogLevel, f string, args ...interface{}) {
+			opts := ctx.nsqd.getOpts()
+			lg.Logf(opts.Logger, opts.LogLevel, lg.LogLevel(level), f, args...)
+		}
+		t.backend = diskqueue.New(
+			topicName,
 			ctx.nsqd.getOpts().DataPath,
 			ctx.nsqd.getOpts().MaxBytesPerFile,
 			int32(minValidMsgLength),
 			int32(ctx.nsqd.getOpts().MaxMsgSize)+minValidMsgLength,
 			ctx.nsqd.getOpts().SyncEvery,
 			ctx.nsqd.getOpts().SyncTimeout,
-			ctx.nsqd.getOpts().Logger)
+			dqLogf,
+		)
 	}
 
-	t.waitGroup.Wrap(func() { t.messagePump() })
+	t.waitGroup.Wrap(t.messagePump)
 
 	t.ctx.nsqd.Notify(t)
 
 	return t
+}
+
+func (t *Topic) Start() {
+	select {
+	case t.startChan <- 1:
+	default:
+	}
 }
 
 // Exiting returns a boolean indicating if this topic is closed/exiting
@@ -167,6 +188,7 @@ func (t *Topic) PutMessage(m *Message) error {
 		return err
 	}
 	atomic.AddUint64(&t.messageCount, 1)
+	atomic.AddUint64(&t.messageBytes, uint64(len(m.Body)))
 	return nil
 }
 
@@ -177,12 +199,20 @@ func (t *Topic) PutMessages(msgs []*Message) error {
 	if atomic.LoadInt32(&t.exitFlag) == 1 {
 		return errors.New("exiting")
 	}
-	for _, m := range msgs {
+
+	messageTotalBytes := 0
+
+	for i, m := range msgs {
 		err := t.put(m)
 		if err != nil {
+			atomic.AddUint64(&t.messageCount, uint64(i))
+			atomic.AddUint64(&t.messageBytes, uint64(messageTotalBytes))
 			return err
 		}
+		messageTotalBytes += len(m.Body)
 	}
+
+	atomic.AddUint64(&t.messageBytes, uint64(messageTotalBytes))
 	atomic.AddUint64(&t.messageCount, uint64(len(msgs)))
 	return nil
 }
@@ -217,19 +247,32 @@ func (t *Topic) messagePump() {
 	var err error
 	var chans []*Channel
 	var memoryMsgChan chan *Message
-	var backendChan chan []byte
+	var backendChan <-chan []byte
 
+	// do not pass messages before Start(), but avoid blocking Pause() or GetChannel()
+	for {
+		select {
+		case <-t.channelUpdateChan:
+			continue
+		case <-t.pauseChan:
+			continue
+		case <-t.exitChan:
+			goto exit
+		case <-t.startChan:
+		}
+		break
+	}
 	t.RLock()
 	for _, c := range t.channelMap {
 		chans = append(chans, c)
 	}
 	t.RUnlock()
-
-	if len(chans) > 0 {
+	if len(chans) > 0 && !t.IsPaused() {
 		memoryMsgChan = t.memoryMsgChan
 		backendChan = t.backend.ReadChan()
 	}
 
+	// main message loop
 	for {
 		select {
 		case msg = <-memoryMsgChan:
@@ -254,8 +297,8 @@ func (t *Topic) messagePump() {
 				backendChan = t.backend.ReadChan()
 			}
 			continue
-		case pause := <-t.pauseChan:
-			if pause || len(chans) == 0 {
+		case <-t.pauseChan:
+			if len(chans) == 0 || t.IsPaused() {
 				memoryMsgChan = nil
 				backendChan = nil
 			} else {
@@ -429,7 +472,7 @@ func (t *Topic) doPause(pause bool) error {
 	}
 
 	select {
-	case t.pauseChan <- pause:
+	case t.pauseChan <- 1:
 	case <-t.exitChan:
 	}
 

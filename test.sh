@@ -1,6 +1,7 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
+export GO111MODULE=on
 GOMAXPROCS=1 go test -timeout 90s ./...
 GOMAXPROCS=4 go test -timeout 90s -race ./...
 

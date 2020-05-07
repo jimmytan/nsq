@@ -7,7 +7,6 @@ import (
 	"io/ioutil"
 	"net"
 	"os"
-	"os/exec"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -158,106 +157,6 @@ func TestStartup(t *testing.T) {
 	<-doneExitChan
 }
 
-func TestMetadataMigrate(t *testing.T) {
-	old_meta := `
-	{
-	  "topics": [
-	    {
-	      "channels": [
-	        {"name": "c1", "paused": false},
-	        {"name": "c2", "paused": false}
-	      ],
-	      "name": "t1",
-	      "paused": false
-	    }
-	  ],
-	  "version": "1.0.0-alpha"
-	}`
-
-	tmpDir, err := ioutil.TempDir("", "nsq-test-")
-	if err != nil {
-		panic(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	opts := NewOptions()
-	opts.DataPath = tmpDir
-	opts.Logger = test.NewTestLogger(t)
-
-	oldFn := oldMetadataFile(opts)
-	err = ioutil.WriteFile(oldFn, []byte(old_meta), 0600)
-	if err != nil {
-		panic(err)
-	}
-
-	_, _, nsqd := mustStartNSQD(opts)
-	err = nsqd.LoadMetadata()
-	test.Nil(t, err)
-	err = nsqd.PersistMetadata()
-	test.Nil(t, err)
-	nsqd.Exit()
-
-	oldFi, err := os.Lstat(oldFn)
-	test.Nil(t, err)
-	test.Equal(t, oldFi.Mode()&os.ModeType, os.ModeSymlink)
-
-	_, _, nsqd = mustStartNSQD(opts)
-	err = nsqd.LoadMetadata()
-	test.Nil(t, err)
-
-	t1, err := nsqd.GetExistingTopic("t1")
-	test.Nil(t, err)
-	test.NotNil(t, t1)
-	c2, err := t1.GetExistingChannel("c2")
-	test.Nil(t, err)
-	test.NotNil(t, c2)
-
-	nsqd.Exit()
-}
-
-func TestMetadataConflict(t *testing.T) {
-	old_meta := `
-	{
-	  "topics": [{
-	    "name": "t1", "paused": false,
-	    "channels": [{"name": "c1", "paused": false}]
-	  }],
-	  "version": "1.0.0-alpha"
-	}`
-	new_meta := `
-	{
-	  "topics": [{
-	    "name": "t2", "paused": false,
-	    "channels": [{"name": "c2", "paused": false}]
-	  }],
-	  "version": "1.0.0-alpha"
-	}`
-
-	tmpDir, err := ioutil.TempDir("", "nsq-test-")
-	if err != nil {
-		panic(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	opts := NewOptions()
-	opts.DataPath = tmpDir
-	opts.Logger = test.NewTestLogger(t)
-
-	err = ioutil.WriteFile(oldMetadataFile(opts), []byte(old_meta), 0600)
-	if err != nil {
-		panic(err)
-	}
-	err = ioutil.WriteFile(newMetadataFile(opts), []byte(new_meta), 0600)
-	if err != nil {
-		panic(err)
-	}
-
-	_, _, nsqd := mustStartNSQD(opts)
-	err = nsqd.LoadMetadata()
-	test.NotNil(t, err)
-	nsqd.Exit()
-}
-
 func TestEphemeralTopicsAndChannels(t *testing.T) {
 	// ephemeral topics/channels are lazily removed after the last channel/client is removed
 	opts := NewOptions()
@@ -280,7 +179,8 @@ func TestEphemeralTopicsAndChannels(t *testing.T) {
 	topic := nsqd.GetTopic(topicName)
 	ephemeralChannel := topic.GetChannel("ch1#ephemeral")
 	client := newClientV2(0, nil, &context{nsqd})
-	ephemeralChannel.AddClient(client.ID, client)
+	err := ephemeralChannel.AddClient(client.ID, client)
+	test.Equal(t, err, nil)
 
 	msg := NewMessage(topic.GenerateID(), body)
 	topic.PutMessage(msg)
@@ -343,8 +243,16 @@ func TestPauseMetadata(t *testing.T) {
 func mustStartNSQLookupd(opts *nsqlookupd.Options) (*net.TCPAddr, *net.TCPAddr, *nsqlookupd.NSQLookupd) {
 	opts.TCPAddress = "127.0.0.1:0"
 	opts.HTTPAddress = "127.0.0.1:0"
-	lookupd := nsqlookupd.New(opts)
-	lookupd.Main()
+	lookupd, err := nsqlookupd.New(opts)
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		err := lookupd.Main()
+		if err != nil {
+			panic(err)
+		}
+	}()
 	return lookupd.RealTCPAddr(), lookupd.RealHTTPAddr(), lookupd
 }
 
@@ -368,32 +276,43 @@ func TestReconfigure(t *testing.T) {
 	defer os.RemoveAll(opts.DataPath)
 	defer nsqd.Exit()
 
-	time.Sleep(200 * time.Millisecond)
-
-	newOpts := *opts
+	newOpts := NewOptions()
+	newOpts.Logger = opts.Logger
 	newOpts.NSQLookupdTCPAddresses = []string{lookupd1.RealTCPAddr().String()}
-	nsqd.swapOpts(&newOpts)
+	nsqd.swapOpts(newOpts)
 	nsqd.triggerOptsNotification()
 	test.Equal(t, 1, len(nsqd.getOpts().NSQLookupdTCPAddresses))
 
-	time.Sleep(200 * time.Millisecond)
-
-	numLookupPeers := len(nsqd.lookupPeers.Load().([]*lookupPeer))
+	var numLookupPeers int
+	for i := 0; i < 100; i++ {
+		numLookupPeers = len(nsqd.lookupPeers.Load().([]*lookupPeer))
+		if numLookupPeers == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	test.Equal(t, 1, numLookupPeers)
 
-	newOpts = *opts
+	newOpts = NewOptions()
+	newOpts.Logger = opts.Logger
 	newOpts.NSQLookupdTCPAddresses = []string{lookupd2.RealTCPAddr().String(), lookupd3.RealTCPAddr().String()}
-	nsqd.swapOpts(&newOpts)
+	nsqd.swapOpts(newOpts)
 	nsqd.triggerOptsNotification()
 	test.Equal(t, 2, len(nsqd.getOpts().NSQLookupdTCPAddresses))
 
-	time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 100; i++ {
+		numLookupPeers = len(nsqd.lookupPeers.Load().([]*lookupPeer))
+		if numLookupPeers == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	test.Equal(t, 2, numLookupPeers)
 
 	var lookupPeers []string
 	for _, lp := range nsqd.lookupPeers.Load().([]*lookupPeer) {
 		lookupPeers = append(lookupPeers, lp.addr)
 	}
-	test.Equal(t, 2, len(lookupPeers))
 	test.Equal(t, newOpts.NSQLookupdTCPAddresses, lookupPeers)
 }
 
@@ -499,14 +418,15 @@ func TestCluster(t *testing.T) {
 func TestSetHealth(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	nsqd := New(opts)
+	nsqd, err := New(opts)
+	test.Nil(t, err)
 	defer nsqd.Exit()
 
-	test.Equal(t, nil, nsqd.GetError())
+	test.Nil(t, nsqd.GetError())
 	test.Equal(t, true, nsqd.IsHealthy())
 
 	nsqd.SetHealth(nil)
-	test.Equal(t, nil, nsqd.GetError())
+	test.Nil(t, nsqd.GetError())
 	test.Equal(t, true, nsqd.IsHealthy())
 
 	nsqd.SetHealth(errors.New("health error"))
@@ -518,21 +438,4 @@ func TestSetHealth(t *testing.T) {
 	test.Nil(t, nsqd.GetError())
 	test.Equal(t, "OK", nsqd.GetHealth())
 	test.Equal(t, true, nsqd.IsHealthy())
-}
-
-func TestCrashingLogger(t *testing.T) {
-	if os.Getenv("BE_CRASHER") == "1" {
-		// Test invalid log level causes error
-		opts := NewOptions()
-		opts.LogLevel = "bad"
-		_ = New(opts)
-		return
-	}
-	cmd := exec.Command(os.Args[0], "-test.run=TestCrashingLogger")
-	cmd.Env = append(os.Environ(), "BE_CRASHER=1")
-	err := cmd.Run()
-	if e, ok := err.(*exec.ExitError); ok && !e.Success() {
-		return
-	}
-	t.Fatalf("process ran with err %v, want exit status 1", err)
 }

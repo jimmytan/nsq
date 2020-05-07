@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"math/rand"
 	"net"
 	"sync/atomic"
@@ -41,6 +40,7 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 
 	clientID := atomic.AddInt64(&p.ctx.nsqd.clientIDSequence, 1)
 	client := newClientV2(clientID, conn, p.ctx)
+	p.ctx.nsqd.AddClient(client.ID, client)
 
 	// synchronize the startup of messagePump in order
 	// to guarantee that it gets a chance to initialize
@@ -118,13 +118,14 @@ func (p *protocolV2) IOLoop(conn net.Conn) error {
 		client.Channel.RemoveClient(client.ID)
 	}
 
+	p.ctx.nsqd.RemoveClient(client.ID)
 	return err
 }
 
-func (p *protocolV2) SendMessage(client *clientV2, msg *Message, buf *bytes.Buffer) error {
+func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 	p.ctx.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): writing msg(%s) to client(%s) - %s", msg.ID, client, msg.Body)
+	var buf = &bytes.Buffer{}
 
-	buf.Reset()
 	_, err := msg.WriteTo(buf)
 	if err != nil {
 		return err
@@ -200,9 +201,8 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 
 func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var err error
-	var buf bytes.Buffer
 	var memoryMsgChan chan *Message
-	var backendMsgChan chan []byte
+	var backendMsgChan <-chan []byte
 	var subChannel *Channel
 	// NOTE: `flusherChan` is used to bound message latency for
 	// the pathological case of a channel on a low volume topic
@@ -313,7 +313,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 
 			subChannel.StartInFlightTimeout(msg, client.ID, msgTimeout)
 			client.SendingMessage()
-			err = p.SendMessage(client, msg, &buf)
+			err = p.SendMessage(client, msg)
 			if err != nil {
 				goto exit
 			}
@@ -326,7 +326,7 @@ func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 
 			subChannel.StartInFlightTimeout(msg, client.ID, msgTimeout)
 			client.SendingMessage()
-			err = p.SendMessage(client, msg, &buf)
+			err = p.SendMessage(client, msg)
 			if err != nil {
 				goto exit
 			}
@@ -394,12 +394,12 @@ func (p *protocolV2) IDENTIFY(client *clientV2, params [][]byte) ([]byte, error)
 
 	tlsv1 := p.ctx.nsqd.tlsConfig != nil && identifyData.TLSv1
 	deflate := p.ctx.nsqd.getOpts().DeflateEnabled && identifyData.Deflate
-	deflateLevel := 0
-	if deflate {
-		if identifyData.DeflateLevel <= 0 {
-			deflateLevel = 6
-		}
-		deflateLevel = int(math.Min(float64(deflateLevel), float64(p.ctx.nsqd.getOpts().MaxDeflateLevel)))
+	deflateLevel := 6
+	if deflate && identifyData.DeflateLevel > 0 {
+		deflateLevel = identifyData.DeflateLevel
+	}
+	if max := p.ctx.nsqd.getOpts().MaxDeflateLevel; max < deflateLevel {
+		deflateLevel = max
 	}
 	snappy := p.ctx.nsqd.getOpts().SnappyEnabled && identifyData.Snappy
 
@@ -472,7 +472,7 @@ func (p *protocolV2) IDENTIFY(client *clientV2, params [][]byte) ([]byte, error)
 	}
 
 	if deflate {
-		p.ctx.nsqd.logf(LOG_INFO, "PROTOCOL(V2): [%s] upgrading connection to deflate", client)
+		p.ctx.nsqd.logf(LOG_INFO, "PROTOCOL(V2): [%s] upgrading connection to deflate (level %d)", client, deflateLevel)
 		err = client.UpgradeDeflate(deflateLevel)
 		if err != nil {
 			return nil, protocol.NewFatalClientErr(err, "E_IDENTIFY_FAILED", "IDENTIFY failed "+err.Error())
@@ -518,21 +518,21 @@ func (p *protocolV2) AUTH(client *clientV2, params [][]byte) ([]byte, error) {
 	}
 
 	if client.HasAuthorizations() {
-		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "AUTH Already set")
+		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "AUTH already set")
 	}
 
 	if !client.ctx.nsqd.IsAuthEnabled() {
-		return nil, protocol.NewFatalClientErr(err, "E_AUTH_DISABLED", "AUTH Disabled")
+		return nil, protocol.NewFatalClientErr(err, "E_AUTH_DISABLED", "AUTH disabled")
 	}
 
 	if err := client.Auth(string(body)); err != nil {
 		// we don't want to leak errors contacting the auth server to untrusted clients
-		p.ctx.nsqd.logf(LOG_WARN, "PROTOCOL(V2): [%s] Auth Failed %s", client, err)
+		p.ctx.nsqd.logf(LOG_WARN, "PROTOCOL(V2): [%s] AUTH failed %s", client, err)
 		return nil, protocol.NewFatalClientErr(err, "E_AUTH_FAILED", "AUTH failed")
 	}
 
 	if !client.HasAuthorizations() {
-		return nil, protocol.NewFatalClientErr(nil, "E_UNAUTHORIZED", "AUTH No authorizations found")
+		return nil, protocol.NewFatalClientErr(nil, "E_UNAUTHORIZED", "AUTH no authorizations found")
 	}
 
 	resp, err := json.Marshal(struct {
@@ -568,7 +568,7 @@ func (p *protocolV2) CheckAuth(client *clientV2, cmd, topicName, channelName str
 		ok, err := client.IsAuthorized(topicName, channelName)
 		if err != nil {
 			// we don't want to leak errors contacting the auth server to untrusted clients
-			p.ctx.nsqd.logf(LOG_WARN, "PROTOCOL(V2): [%s] Auth Failed %s", client, err)
+			p.ctx.nsqd.logf(LOG_WARN, "PROTOCOL(V2): [%s] AUTH failed %s", client, err)
 			return protocol.NewFatalClientErr(nil, "E_AUTH_FAILED", "AUTH failed")
 		}
 		if !ok {
@@ -615,7 +615,11 @@ func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	for {
 		topic := p.ctx.nsqd.GetTopic(topicName)
 		channel = topic.GetChannel(channelName)
-		channel.AddClient(client.ID, client)
+		if err := channel.AddClient(client.ID, client); err != nil {
+			return nil, protocol.NewFatalClientErr(nil, "E_TOO_MANY_CHANNEL_CONSUMERS",
+				fmt.Sprintf("channel consumers for %s:%s exceeds limit of %d",
+					topicName, channelName, p.ctx.nsqd.getOpts().MaxChannelConsumers))
+		}
 
 		if (channel.ephemeral && channel.Exiting()) || (topic.ephemeral && topic.Exiting()) {
 			channel.RemoveClient(client.ID)
@@ -801,6 +805,8 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 		return nil, protocol.NewFatalClientErr(err, "E_PUB_FAILED", "PUB failed "+err.Error())
 	}
 
+	client.PublishedMessage(topicName, 1)
+
 	return okBytes, nil
 }
 
@@ -851,6 +857,8 @@ func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_MPUB_FAILED", "MPUB failed "+err.Error())
 	}
+
+	client.PublishedMessage(topicName, uint64(len(messages)))
 
 	return okBytes, nil
 }
@@ -913,6 +921,8 @@ func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	if err != nil {
 		return nil, protocol.NewFatalClientErr(err, "E_DPUB_FAILED", "DPUB failed "+err.Error())
 	}
+
+	client.PublishedMessage(topicName, 1)
 
 	return okBytes, nil
 }

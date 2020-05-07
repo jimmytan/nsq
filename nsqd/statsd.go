@@ -3,9 +3,11 @@ package nsqd
 import (
 	"fmt"
 	"math"
+	"net"
 	"time"
 
 	"github.com/nsqio/nsq/internal/statsd"
+	"github.com/nsqio/nsq/internal/writers"
 )
 
 type Uint64Slice []uint64
@@ -25,22 +27,27 @@ func (s Uint64Slice) Less(i, j int) bool {
 func (n *NSQD) statsdLoop() {
 	var lastMemStats memStats
 	var lastStats []TopicStats
-	ticker := time.NewTicker(n.getOpts().StatsdInterval)
+	interval := n.getOpts().StatsdInterval
+	ticker := time.NewTicker(interval)
 	for {
 		select {
 		case <-n.exitChan:
 			goto exit
 		case <-ticker.C:
-			client := statsd.NewClient(n.getOpts().StatsdAddress, n.getOpts().StatsdPrefix)
-			err := client.CreateSocket()
+			addr := n.getOpts().StatsdAddress
+			prefix := n.getOpts().StatsdPrefix
+			conn, err := net.DialTimeout("udp", addr, time.Second)
 			if err != nil {
-				n.logf(LOG_ERROR, "failed to create UDP socket to statsd(%s)", client)
+				n.logf(LOG_ERROR, "failed to create UDP socket to statsd(%s)", addr)
 				continue
 			}
+			sw := writers.NewSpreadWriter(conn, interval-time.Second, n.exitChan)
+			bw := writers.NewBoundaryBufferedWriter(sw, n.getOpts().StatsdUDPPacketSize)
+			client := statsd.NewClient(bw, prefix)
 
-			n.logf(LOG_INFO, "STATSD: pushing stats to %s", client)
+			n.logf(LOG_INFO, "STATSD: pushing stats to %s", addr)
 
-			stats := n.GetStats()
+			stats := n.GetStats("", "", false)
 			for _, topic := range stats {
 				// try to find the topic in the last collection
 				lastTopic := TopicStats{}
@@ -52,6 +59,10 @@ func (n *NSQD) statsdLoop() {
 				}
 				diff := topic.MessageCount - lastTopic.MessageCount
 				stat := fmt.Sprintf("topic.%s.message_count", topic.TopicName)
+				client.Incr(stat, int64(diff))
+
+				diff = topic.MessageBytes - lastTopic.MessageBytes
+				stat = fmt.Sprintf("topic.%s.message_bytes", topic.TopicName)
 				client.Incr(stat, int64(diff))
 
 				stat = fmt.Sprintf("topic.%s.depth", topic.TopicName)
@@ -102,7 +113,7 @@ func (n *NSQD) statsdLoop() {
 					client.Incr(stat, int64(diff))
 
 					stat = fmt.Sprintf("topic.%s.channel.%s.clients", topic.TopicName, channel.ChannelName)
-					client.Gauge(stat, int64(len(channel.Clients)))
+					client.Gauge(stat, int64(channel.ClientCount))
 
 					for _, item := range channel.E2eProcessingLatency.Percentiles {
 						stat = fmt.Sprintf("topic.%s.channel.%s.e2e_processing_latency_%.0f", topic.TopicName, channel.ChannelName, item["quantile"]*100.0)
@@ -128,12 +139,15 @@ func (n *NSQD) statsdLoop() {
 				lastMemStats = ms
 			}
 
-			client.Close()
+			bw.Flush()
+			sw.Flush()
+			conn.Close()
 		}
 	}
 
 exit:
 	ticker.Stop()
+	n.logf(LOG_INFO, "STATSD: closing")
 }
 
 func percentile(perc float64, arr []uint64, length int) uint64 {

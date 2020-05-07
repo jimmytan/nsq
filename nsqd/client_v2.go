@@ -55,6 +55,8 @@ type clientV2 struct {
 	FinishCount   uint64
 	RequeueCount  uint64
 
+	pubCounts map[string]uint64
+
 	writeLock sync.RWMutex
 	metaLock  sync.RWMutex
 
@@ -122,7 +124,7 @@ func newClientV2(id int64, conn net.Conn, ctx *context) *clientV2 {
 		Writer: bufio.NewWriterSize(conn, defaultBufferSize),
 
 		OutputBufferSize:    defaultBufferSize,
-		OutputBufferTimeout: 250 * time.Millisecond,
+		OutputBufferTimeout: ctx.nsqd.getOpts().OutputBufferTimeout,
 
 		MsgTimeout: ctx.nsqd.getOpts().MsgTimeout,
 
@@ -141,6 +143,8 @@ func newClientV2(id int64, conn net.Conn, ctx *context) *clientV2 {
 
 		// heartbeats are client configurable but default to 30s
 		HeartbeatInterval: ctx.nsqd.getOpts().ClientTimeout / 2,
+
+		pubCounts: make(map[string]uint64),
 	}
 	c.lenSlice = c.lenBuf[:]
 	return c
@@ -164,12 +168,7 @@ func (c *clientV2) Identify(data identifyDataV2) error {
 		return err
 	}
 
-	err = c.SetOutputBufferSize(data.OutputBufferSize)
-	if err != nil {
-		return err
-	}
-
-	err = c.SetOutputBufferTimeout(data.OutputBufferTimeout)
+	err = c.SetOutputBuffer(data.OutputBufferSize, data.OutputBufferTimeout)
 	if err != nil {
 		return err
 	}
@@ -211,6 +210,13 @@ func (c *clientV2) Stats() ClientStats {
 		identity = c.AuthState.Identity
 		identityURL = c.AuthState.IdentityURL
 	}
+	pubCounts := make([]PubCount, 0, len(c.pubCounts))
+	for topic, count := range c.pubCounts {
+		pubCounts = append(pubCounts, PubCount{
+			Topic: topic,
+			Count: count,
+		})
+	}
 	c.metaLock.RUnlock()
 	stats := ClientStats{
 		Version:         "V2",
@@ -232,6 +238,7 @@ func (c *clientV2) Stats() ClientStats {
 		Authed:          c.HasAuthorizations(),
 		AuthIdentity:    identity,
 		AuthIdentityURL: identityURL,
+		PubCounts:       pubCounts,
 	}
 	if stats.TLS {
 		p := prettyConnectionState{c.tlsConn.ConnectionState()}
@@ -241,6 +248,13 @@ func (c *clientV2) Stats() ClientStats {
 		stats.TLSNegotiatedProtocolIsMutual = p.NegotiatedProtocolIsMutual
 	}
 	return stats
+}
+
+func (c *clientV2) IsProducer() bool {
+	c.metaLock.RLock()
+	retval := len(c.pubCounts) > 0
+	c.metaLock.RUnlock()
+	return retval
 }
 
 // struct to convert from integers to the human readable strings
@@ -313,8 +327,11 @@ func (c *clientV2) IsReadyForMessages() bool {
 }
 
 func (c *clientV2) SetReadyCount(count int64) {
-	atomic.StoreInt64(&c.ReadyCount, count)
-	c.tryUpdateReadyState()
+	oldCount := atomic.SwapInt64(&c.ReadyCount, count)
+
+	if oldCount != count {
+		c.tryUpdateReadyState()
+	}
 }
 
 func (c *clientV2) tryUpdateReadyState() {
@@ -341,6 +358,12 @@ func (c *clientV2) Empty() {
 func (c *clientV2) SendingMessage() {
 	atomic.AddInt64(&c.InFlightCount, 1)
 	atomic.AddUint64(&c.MessageCount, 1)
+}
+
+func (c *clientV2) PublishedMessage(topic string, count uint64) {
+	c.metaLock.Lock()
+	c.pubCounts[topic] += count
+	c.metaLock.Unlock()
 }
 
 func (c *clientV2) TimedOutMessage() {
@@ -388,36 +411,7 @@ func (c *clientV2) SetHeartbeatInterval(desiredInterval int) error {
 	return nil
 }
 
-func (c *clientV2) SetOutputBufferSize(desiredSize int) error {
-	var size int
-
-	switch {
-	case desiredSize == -1:
-		// effectively no buffer (every write will go directly to the wrapped net.Conn)
-		size = 1
-	case desiredSize == 0:
-		// do nothing (use default)
-	case desiredSize >= 64 && desiredSize <= int(c.ctx.nsqd.getOpts().MaxOutputBufferSize):
-		size = desiredSize
-	default:
-		return fmt.Errorf("output buffer size (%d) is invalid", desiredSize)
-	}
-
-	if size > 0 {
-		c.writeLock.Lock()
-		defer c.writeLock.Unlock()
-		c.OutputBufferSize = size
-		err := c.Writer.Flush()
-		if err != nil {
-			return err
-		}
-		c.Writer = bufio.NewWriterSize(c.Conn, size)
-	}
-
-	return nil
-}
-
-func (c *clientV2) SetOutputBufferTimeout(desiredTimeout int) error {
+func (c *clientV2) SetOutputBuffer(desiredSize int, desiredTimeout int) error {
 	c.writeLock.Lock()
 	defer c.writeLock.Unlock()
 
@@ -426,11 +420,34 @@ func (c *clientV2) SetOutputBufferTimeout(desiredTimeout int) error {
 		c.OutputBufferTimeout = 0
 	case desiredTimeout == 0:
 		// do nothing (use default)
-	case desiredTimeout >= 1 &&
+	case true &&
+		desiredTimeout >= int(c.ctx.nsqd.getOpts().MinOutputBufferTimeout/time.Millisecond) &&
 		desiredTimeout <= int(c.ctx.nsqd.getOpts().MaxOutputBufferTimeout/time.Millisecond):
+
 		c.OutputBufferTimeout = time.Duration(desiredTimeout) * time.Millisecond
 	default:
 		return fmt.Errorf("output buffer timeout (%d) is invalid", desiredTimeout)
+	}
+
+	switch {
+	case desiredSize == -1:
+		// effectively no buffer (every write will go directly to the wrapped net.Conn)
+		c.OutputBufferSize = 1
+		c.OutputBufferTimeout = 0
+	case desiredSize == 0:
+		// do nothing (use default)
+	case desiredSize >= 64 && desiredSize <= int(c.ctx.nsqd.getOpts().MaxOutputBufferSize):
+		c.OutputBufferSize = desiredSize
+	default:
+		return fmt.Errorf("output buffer size (%d) is invalid", desiredSize)
+	}
+
+	if desiredSize != 0 {
+		err := c.Writer.Flush()
+		if err != nil {
+			return err
+		}
+		c.Writer = bufio.NewWriterSize(c.Conn, c.OutputBufferSize)
 	}
 
 	return nil
@@ -544,14 +561,18 @@ func (c *clientV2) QueryAuthd() error {
 		return err
 	}
 
-	tls := atomic.LoadInt32(&c.TLS) == 1
-	tlsEnabled := "false"
-	if tls {
-		tlsEnabled = "true"
+	tlsEnabled := atomic.LoadInt32(&c.TLS) == 1
+	commonName := ""
+	if tlsEnabled {
+		tlsConnState := c.tlsConn.ConnectionState()
+		if len(tlsConnState.PeerCertificates) > 0 {
+			commonName = tlsConnState.PeerCertificates[0].Subject.CommonName
+		}
 	}
 
 	authState, err := auth.QueryAnyAuthd(c.ctx.nsqd.getOpts().AuthHTTPAddresses,
-		remoteIP, tlsEnabled, c.AuthSecret, c.ctx.nsqd.getOpts().HTTPClientConnectTimeout,
+		remoteIP, tlsEnabled, commonName, c.AuthSecret,
+		c.ctx.nsqd.getOpts().HTTPClientConnectTimeout,
 		c.ctx.nsqd.getOpts().HTTPClientRequestTimeout)
 	if err != nil {
 		return err

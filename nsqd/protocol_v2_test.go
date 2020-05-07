@@ -41,8 +41,16 @@ func mustStartNSQD(opts *Options) (*net.TCPAddr, *net.TCPAddr, *NSQD) {
 		}
 		opts.DataPath = tmpDir
 	}
-	nsqd := New(opts)
-	nsqd.Main()
+	nsqd, err := New(opts)
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		err := nsqd.Main()
+		if err != nil {
+			panic(err)
+		}
+	}()
 	return nsqd.RealTCPAddr(), nsqd.RealHTTPAddr(), nsqd
 }
 
@@ -208,7 +216,7 @@ func TestClientTimeout(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
 	opts.ClientTimeout = 150 * time.Millisecond
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
 	defer nsqd.Exit()
@@ -281,7 +289,7 @@ func TestClientHeartbeatDisableSUB(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
 	opts.ClientTimeout = 200 * time.Millisecond
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
 	defer nsqd.Exit()
@@ -441,7 +449,7 @@ func TestEmptyCommand(t *testing.T) {
 func TestSizeLimits(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.MaxMsgSize = 100
 	opts.MaxBodySize = 1000
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
@@ -558,7 +566,7 @@ func TestSizeLimits(t *testing.T) {
 func TestDPUB(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
 	defer nsqd.Exit()
@@ -601,7 +609,7 @@ func TestDPUB(t *testing.T) {
 func TestTouch(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.MsgTimeout = 150 * time.Millisecond
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
@@ -647,7 +655,7 @@ func TestTouch(t *testing.T) {
 func TestMaxRdyCount(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.MaxRdyCount = 50
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
@@ -719,7 +727,7 @@ func TestFatalError(t *testing.T) {
 func TestOutputBuffering(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.MaxOutputBufferSize = 512 * 1024
 	opts.MaxOutputBufferTimeout = time.Second
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
@@ -771,7 +779,7 @@ func TestOutputBuffering(t *testing.T) {
 func TestOutputBufferingValidity(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.MaxOutputBufferSize = 512 * 1024
 	opts.MaxOutputBufferTimeout = time.Second
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
@@ -814,7 +822,7 @@ func TestOutputBufferingValidity(t *testing.T) {
 func TestTLS(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.TLSCert = "./test/certs/server.pem"
 	opts.TLSKey = "./test/certs/server.key"
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
@@ -853,7 +861,7 @@ func TestTLS(t *testing.T) {
 func TestTLSRequired(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.TLSCert = "./test/certs/server.pem"
 	opts.TLSKey = "./test/certs/server.key"
 	opts.TLSRequired = TLSRequiredExceptHTTP
@@ -902,7 +910,7 @@ func TestTLSRequired(t *testing.T) {
 func TestTLSAuthRequire(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.TLSCert = "./test/certs/server.pem"
 	opts.TLSKey = "./test/certs/server.key"
 	opts.TLSClientAuthPolicy = "require"
@@ -968,7 +976,7 @@ func TestTLSAuthRequire(t *testing.T) {
 func TestTLSAuthRequireVerify(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.TLSCert = "./test/certs/server.pem"
 	opts.TLSKey = "./test/certs/server.key"
 	opts.TLSRootCAFile = "./test/certs/ca.pem"
@@ -1057,7 +1065,7 @@ func TestTLSAuthRequireVerify(t *testing.T) {
 func TestDeflate(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.DeflateEnabled = true
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
@@ -1093,7 +1101,7 @@ type readWriter struct {
 func TestSnappy(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.SnappyEnabled = true
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
@@ -1146,7 +1154,7 @@ func TestSnappy(t *testing.T) {
 func TestTLSDeflate(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.DeflateEnabled = true
 	opts.TLSCert = "./test/certs/cert.pem"
 	opts.TLSKey = "./test/certs/key.pem"
@@ -1203,7 +1211,7 @@ func TestSampling(t *testing.T) {
 
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.MaxRdyCount = int64(num)
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
@@ -1270,7 +1278,7 @@ func TestSampling(t *testing.T) {
 func TestTLSSnappy(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.SnappyEnabled = true
 	opts.TLSCert = "./test/certs/cert.pem"
 	opts.TLSKey = "./test/certs/key.pem"
@@ -1321,7 +1329,7 @@ func TestTLSSnappy(t *testing.T) {
 func TestClientMsgTimeout(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.QueueScanRefreshInterval = 100 * time.Millisecond
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
@@ -1380,7 +1388,7 @@ func TestClientMsgTimeout(t *testing.T) {
 func TestBadFin(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
 	defer nsqd.Exit()
@@ -1406,7 +1414,7 @@ func TestBadFin(t *testing.T) {
 func TestReqTimeoutRange(t *testing.T) {
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.MaxReqTimeout = 1 * time.Minute
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
@@ -1466,9 +1474,11 @@ func TestReqTimeoutRange(t *testing.T) {
 func TestClientAuth(t *testing.T) {
 	authResponse := `{"ttl":1, "authorizations":[]}`
 	authSecret := "testsecret"
-	authError := "E_UNAUTHORIZED AUTH No authorizations found"
+	authError := "E_UNAUTHORIZED AUTH no authorizations found"
 	authSuccess := ""
-	runAuthTest(t, authResponse, authSecret, authError, authSuccess)
+	tlsEnabled := false
+	commonName := ""
+	runAuthTest(t, authResponse, authSecret, authError, authSuccess, tlsEnabled, commonName)
 
 	// now one that will succeed
 	authResponse = `{"ttl":10, "authorizations":
@@ -1476,20 +1486,29 @@ func TestClientAuth(t *testing.T) {
 	}`
 	authError = ""
 	authSuccess = `{"identity":"","identity_url":"","permission_count":1}`
-	runAuthTest(t, authResponse, authSecret, authError, authSuccess)
+	runAuthTest(t, authResponse, authSecret, authError, authSuccess, tlsEnabled, commonName)
 
+	// one with TLS enabled
+	tlsEnabled = true
+	commonName = "test.local"
+	runAuthTest(t, authResponse, authSecret, authError, authSuccess, tlsEnabled, commonName)
 }
 
-func runAuthTest(t *testing.T, authResponse, authSecret, authError, authSuccess string) {
+func runAuthTest(t *testing.T, authResponse string, authSecret string, authError string,
+	authSuccess string, tlsEnabled bool, commonName string) {
 	var err error
-	var expectedAuthIP string
-	expectedAuthTLS := "false"
+	var expectedRemoteIP string
+	expectedTLS := "false"
+	if tlsEnabled {
+		expectedTLS = "true"
+	}
 
 	authd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Logf("in test auth handler %s", r.RequestURI)
 		r.ParseForm()
-		test.Equal(t, expectedAuthIP, r.Form.Get("remote_ip"))
-		test.Equal(t, expectedAuthTLS, r.Form.Get("tls"))
+		test.Equal(t, expectedRemoteIP, r.Form.Get("remote_ip"))
+		test.Equal(t, expectedTLS, r.Form.Get("tls"))
+		test.Equal(t, commonName, r.Form.Get("common_name"))
 		test.Equal(t, authSecret, r.Form.Get("secret"))
 		fmt.Fprint(w, authResponse)
 	}))
@@ -1500,8 +1519,13 @@ func runAuthTest(t *testing.T, authResponse, authSecret, authError, authSuccess 
 
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 	opts.AuthHTTPAddresses = []string{addr.Host}
+	if tlsEnabled {
+		opts.TLSCert = "./test/certs/server.pem"
+		opts.TLSKey = "./test/certs/server.key"
+		opts.TLSClientAuthPolicy = "require"
+	}
 	tcpAddr, _, nsqd := mustStartNSQD(opts)
 	defer os.RemoveAll(opts.DataPath)
 	defer nsqd.Exit()
@@ -1510,19 +1534,46 @@ func runAuthTest(t *testing.T, authResponse, authSecret, authError, authSuccess 
 	test.Nil(t, err)
 	defer conn.Close()
 
-	expectedAuthIP, _, _ = net.SplitHostPort(conn.LocalAddr().String())
+	data := identify(t, conn, map[string]interface{}{
+		"tls_v1": tlsEnabled,
+	}, frameTypeResponse)
+	r := struct {
+		TLSv1 bool `json:"tls_v1"`
+	}{}
+	err = json.Unmarshal(data, &r)
+	test.Nil(t, err)
+	test.Equal(t, tlsEnabled, r.TLSv1)
 
-	identify(t, conn, map[string]interface{}{
-		"tls_v1": false,
-	}, nsq.FrameTypeResponse)
+	var c io.ReadWriter
+	var tlsConn *tls.Conn
+	c = conn
+	if tlsEnabled {
+		cert, err := tls.LoadX509KeyPair("./test/certs/cert.pem", "./test/certs/key.pem")
+		test.Nil(t, err)
+		tlsConfig := &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			InsecureSkipVerify: true,
+		}
+		tlsConn = tls.Client(conn, tlsConfig)
+		err = tlsConn.Handshake()
+		test.Nil(t, err)
+		c = tlsConn
 
-	authCmd(t, conn, authSecret, authSuccess)
-	if authError != "" {
-		readValidate(t, conn, nsq.FrameTypeError, authError)
-	} else {
-		sub(t, conn, "test", "ch")
+		resp, _ := nsq.ReadResponse(tlsConn)
+		frameType, data, _ := nsq.UnpackResponse(resp)
+		t.Logf("frameType: %d, data: %s", frameType, data)
+		test.Equal(t, frameTypeResponse, frameType)
+		test.Equal(t, []byte("OK"), data)
 	}
 
+	expectedRemoteIP, _, _ = net.SplitHostPort(conn.LocalAddr().String())
+
+	authCmd(t, c, authSecret, authSuccess)
+	if authError != "" {
+		readValidate(t, c, frameTypeError, authError)
+	} else {
+		sub(t, c, "test", "ch")
+	}
 }
 
 func TestIOLoopReturnsClientErrWhenSendFails(t *testing.T) {
@@ -1550,13 +1601,14 @@ func testIOLoopReturnsClientErr(t *testing.T, fakeConn test.FakeNetConn) {
 
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(t)
-	opts.LogLevel = "debug"
+	opts.LogLevel = LOG_DEBUG
 
-	prot := &protocolV2{ctx: &context{nsqd: New(opts)}}
+	nsqd, err := New(opts)
+	test.Nil(t, err)
+	prot := &protocolV2{ctx: &context{nsqd: nsqd}}
 	defer prot.ctx.nsqd.Exit()
 
-	err := prot.IOLoop(fakeConn)
-
+	err = prot.IOLoop(fakeConn)
 	test.NotNil(t, err)
 	test.Equal(t, "E_INVALID invalid command INVALID_COMMAND", err.Error())
 	test.NotNil(t, err.(*protocol.FatalClientErr))
@@ -1566,7 +1618,7 @@ func BenchmarkProtocolV2Exec(b *testing.B) {
 	b.StopTimer()
 	opts := NewOptions()
 	opts.Logger = test.NewTestLogger(b)
-	nsqd := New(opts)
+	nsqd, _ := New(opts)
 	ctx := &context{nsqd}
 	p := &protocolV2{ctx}
 	c := newClientV2(0, nil, ctx)

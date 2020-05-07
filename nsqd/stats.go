@@ -14,6 +14,7 @@ type TopicStats struct {
 	Depth        int64          `json:"depth"`
 	BackendDepth int64          `json:"backend_depth"`
 	MessageCount uint64         `json:"message_count"`
+	MessageBytes uint64         `json:"message_bytes"`
 	Paused       bool           `json:"paused"`
 
 	E2eProcessingLatency *quantile.Result `json:"e2e_processing_latency"`
@@ -26,6 +27,7 @@ func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
 		Depth:        t.Depth(),
 		BackendDepth: t.backend.Depth(),
 		MessageCount: atomic.LoadUint64(&t.messageCount),
+		MessageBytes: atomic.LoadUint64(&t.messageBytes),
 		Paused:       t.IsPaused(),
 
 		E2eProcessingLatency: t.AggregateChannelE2eProcessingLatency().Result(),
@@ -41,27 +43,41 @@ type ChannelStats struct {
 	MessageCount  uint64        `json:"message_count"`
 	RequeueCount  uint64        `json:"requeue_count"`
 	TimeoutCount  uint64        `json:"timeout_count"`
+	ClientCount   int           `json:"client_count"`
 	Clients       []ClientStats `json:"clients"`
 	Paused        bool          `json:"paused"`
 
 	E2eProcessingLatency *quantile.Result `json:"e2e_processing_latency"`
 }
 
-func NewChannelStats(c *Channel, clients []ClientStats) ChannelStats {
+func NewChannelStats(c *Channel, clients []ClientStats, clientCount int) ChannelStats {
+	c.inFlightMutex.Lock()
+	inflight := len(c.inFlightMessages)
+	c.inFlightMutex.Unlock()
+	c.deferredMutex.Lock()
+	deferred := len(c.deferredMessages)
+	c.deferredMutex.Unlock()
+
 	return ChannelStats{
 		ChannelName:   c.name,
 		Depth:         c.Depth(),
 		BackendDepth:  c.backend.Depth(),
-		InFlightCount: len(c.inFlightMessages),
-		DeferredCount: len(c.deferredMessages),
+		InFlightCount: inflight,
+		DeferredCount: deferred,
 		MessageCount:  atomic.LoadUint64(&c.messageCount),
 		RequeueCount:  atomic.LoadUint64(&c.requeueCount),
 		TimeoutCount:  atomic.LoadUint64(&c.timeoutCount),
+		ClientCount:   clientCount,
 		Clients:       clients,
 		Paused:        c.IsPaused(),
 
 		E2eProcessingLatency: c.e2eProcessingLatencyStream.Result(),
 	}
+}
+
+type PubCount struct {
+	Topic string `json:"topic"`
+	Count uint64 `json:"count"`
 }
 
 type ClientStats struct {
@@ -83,6 +99,8 @@ type ClientStats struct {
 	Authed          bool   `json:"authed,omitempty"`
 	AuthIdentity    string `json:"auth_identity,omitempty"`
 	AuthIdentityURL string `json:"auth_identity_url,omitempty"`
+
+	PubCounts []PubCount `json:"pub_counts,omitempty"`
 
 	TLS                           bool   `json:"tls"`
 	CipherSuite                   string `json:"tls_cipher_suite"`
@@ -113,36 +131,73 @@ type ChannelsByName struct {
 
 func (c ChannelsByName) Less(i, j int) bool { return c.Channels[i].name < c.Channels[j].name }
 
-func (n *NSQD) GetStats() []TopicStats {
+func (n *NSQD) GetStats(topic string, channel string, includeClients bool) []TopicStats {
 	n.RLock()
-	realTopics := make([]*Topic, 0, len(n.topicMap))
-	for _, t := range n.topicMap {
-		realTopics = append(realTopics, t)
+	var realTopics []*Topic
+	if topic == "" {
+		realTopics = make([]*Topic, 0, len(n.topicMap))
+		for _, t := range n.topicMap {
+			realTopics = append(realTopics, t)
+		}
+	} else if val, exists := n.topicMap[topic]; exists {
+		realTopics = []*Topic{val}
+	} else {
+		n.RUnlock()
+		return []TopicStats{}
 	}
 	n.RUnlock()
 	sort.Sort(TopicsByName{realTopics})
 	topics := make([]TopicStats, 0, len(realTopics))
 	for _, t := range realTopics {
 		t.RLock()
-		realChannels := make([]*Channel, 0, len(t.channelMap))
-		for _, c := range t.channelMap {
-			realChannels = append(realChannels, c)
+		var realChannels []*Channel
+		if channel == "" {
+			realChannels = make([]*Channel, 0, len(t.channelMap))
+			for _, c := range t.channelMap {
+				realChannels = append(realChannels, c)
+			}
+		} else if val, exists := t.channelMap[channel]; exists {
+			realChannels = []*Channel{val}
+		} else {
+			t.RUnlock()
+			continue
 		}
 		t.RUnlock()
 		sort.Sort(ChannelsByName{realChannels})
 		channels := make([]ChannelStats, 0, len(realChannels))
 		for _, c := range realChannels {
+			var clients []ClientStats
+			var clientCount int
 			c.RLock()
-			clients := make([]ClientStats, 0, len(c.clients))
-			for _, client := range c.clients {
-				clients = append(clients, client.Stats())
+			if includeClients {
+				clients = make([]ClientStats, 0, len(c.clients))
+				for _, client := range c.clients {
+					clients = append(clients, client.Stats())
+				}
 			}
+			clientCount = len(c.clients)
 			c.RUnlock()
-			channels = append(channels, NewChannelStats(c, clients))
+			channels = append(channels, NewChannelStats(c, clients, clientCount))
 		}
 		topics = append(topics, NewTopicStats(t, channels))
 	}
 	return topics
+}
+
+func (n *NSQD) GetProducerStats() []ClientStats {
+	n.clientLock.RLock()
+	var producers []Client
+	for _, c := range n.clients {
+		if c.IsProducer() {
+			producers = append(producers, c)
+		}
+	}
+	n.clientLock.RUnlock()
+	producerStats := make([]ClientStats, 0, len(producers))
+	for _, p := range producers {
+		producerStats = append(producerStats, p.Stats())
+	}
+	return producerStats
 }
 
 type memStats struct {
